@@ -2,7 +2,7 @@
 
 ## Deploy
 
-`.github/workflows/deploy.yml` is the one deploy for Origin sites. It logs in to the server as `deploy`, checks the server's key against a pinned copy, and runs one script from `/home/deploy/bin` with the pushed ref and commit. Those scripts, and the one sudo rule each needs, are in the private server repo.
+`.github/workflows/deploy.yml` is the one deploy for Origin sites. It logs in to the server as `deploy` and checks the server's key against a pinned copy. The deploy key's forced command on the server runs the site's script; the workflow sends only the pushed ref and commit, and the script accepts exactly `<x.y.z> <40-hex sha>`. The scripts, and the one sudo rule each needs, are in the private server repo. `live` and `test` name the script each site's key runs, so a run says which it deployed.
 
 Each site repo has one `.github/workflows/deploy.yml` like this:
 
