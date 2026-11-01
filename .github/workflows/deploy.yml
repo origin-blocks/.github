@@ -1,0 +1,125 @@
+# The one deploy for Origin sites. Each site repo calls it from a short
+# .github/workflows/deploy.yml; README.md shows that file and the secrets.
+#
+# It logs in to the server as deploy, checks the server's key against a pinned
+# copy, and runs one script from /home/deploy/bin with the pushed ref and
+# commit. That script, and what it may do as root, live in the private server
+# repo (Misplon/hetzner-server).
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      live:
+        description: Script that deploys the live site, e.g. deploy-canvas-demo.
+        type: string
+        default: ''
+      test:
+        description: Script that deploys the test site.
+        type: string
+        default: ''
+      live-branches:
+        description: Branches that deploy the live site, separated by spaces. Empty means none.
+        type: string
+        default: master main
+      live-tags:
+        description: Whether a pushed release tag (1.2.3) deploys the live site.
+        type: boolean
+        default: false
+      test-branches:
+        description: Branches that deploy the test site, separated by spaces.
+        type: string
+        default: testing staging
+
+permissions: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # One deploy at a time per repo and site. A push waits for the running
+    # deploy. A later push may replace a waiting one, which loses nothing:
+    # the server script always ships the ref it is given.
+    concurrency:
+      group: deploy-${{ github.repository }}-${{ inputs.live }}-${{ inputs.test }}
+      cancel-in-progress: false
+    steps:
+      - name: Pick the site for this ref
+        id: site
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF: ${{ github.ref_name }}
+          LIVE: ${{ inputs.live }}
+          TEST: ${{ inputs.test }}
+          LIVE_BRANCHES: ${{ inputs.live-branches }}
+          LIVE_TAGS: ${{ inputs.live-tags }}
+          TEST_BRANCHES: ${{ inputs.test-branches }}
+        run: |
+          if [ "$REF_TYPE" = tag ]; then
+            if [ -n "$LIVE" ] && [ "$LIVE_TAGS" = true ] && [[ "$REF" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "site=live" >> "$GITHUB_OUTPUT"; script="$LIVE"
+            else
+              echo "::error::Tag $REF deploys no site. Release tags deploy the live site only when live-tags is true."
+              exit 1
+            fi
+          elif [ -n "$LIVE" ] && [[ " $LIVE_BRANCHES " == *" $REF "* ]]; then
+            echo "site=live" >> "$GITHUB_OUTPUT"; script="$LIVE"
+          elif [ -n "$TEST" ] && [[ " $TEST_BRANCHES " == *" $REF "* ]]; then
+            echo "site=test" >> "$GITHUB_OUTPUT"; script="$TEST"
+          else
+            echo "::error::Branch $REF deploys no site. Live: $LIVE_BRANCHES. Test: $TEST_BRANCHES."
+            exit 1
+          fi
+          if ! [[ "$script" =~ ^deploy-[a-z0-9-]+$ ]]; then
+            echo "::error::Script name must look like deploy-<name>, got: $script"
+            exit 1
+          fi
+          if ! [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error::Ref name has characters the server script does not accept: $REF"
+            exit 1
+          fi
+          echo "script=$script" >> "$GITHUB_OUTPUT"
+
+      - name: Run the deploy script on the server
+        # The site is picked in the shell, not with && and || in an expression,
+        # because an empty live secret would fall through to the test value.
+        env:
+          SITE: ${{ steps.site.outputs.site }}
+          SCRIPT: ${{ steps.site.outputs.script }}
+          REF: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          LIVE_HOST: ${{ secrets.DEPLOY_HOST }}
+          LIVE_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          TEST_HOST: ${{ secrets.TEST_DEPLOY_HOST }}
+          TEST_KNOWN_HOSTS: ${{ secrets.TEST_DEPLOY_KNOWN_HOSTS }}
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          if [ "$SITE" = live ]; then
+            HOST="$LIVE_HOST"; KNOWN_HOSTS="$LIVE_KNOWN_HOSTS"; PREFIX=DEPLOY
+          else
+            HOST="$TEST_HOST"; KNOWN_HOSTS="$TEST_KNOWN_HOSTS"; PREFIX=TEST_DEPLOY
+          fi
+          missing=""
+          [ -n "$HOST" ] || missing="$missing ${PREFIX}_HOST"
+          [ -n "$KNOWN_HOSTS" ] || missing="$missing ${PREFIX}_KNOWN_HOSTS"
+          [ -n "$SSH_KEY" ] || missing="$missing DEPLOY_SSH_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing secrets:$missing"
+            exit 1
+          fi
+          dir="$RUNNER_TEMP/ssh"
+          mkdir -m 700 "$dir"
+          printf '%s\n' "$SSH_KEY" > "$dir/key"
+          printf '%s\n' "$KNOWN_HOSTS" > "$dir/known_hosts"
+          chmod 600 "$dir/key"
+          # -F and GlobalKnownHostsFile keep the runner's own SSH files out, so
+          # only the pinned key is trusted. The script gets the ref and the
+          # commit, and ships exactly that commit.
+          ssh -F /dev/null -i "$dir/key" \
+            -o GlobalKnownHostsFile=/dev/null \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o ConnectTimeout=30 \
+            -o UserKnownHostsFile="$dir/known_hosts" \
+            -o StrictHostKeyChecking=yes \
+            "deploy@$HOST" "/home/deploy/bin/$SCRIPT" "$REF" "$SHA"
